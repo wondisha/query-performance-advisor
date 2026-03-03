@@ -1,0 +1,302 @@
+name: Query Performance Model
+description: Semantic model for analyzing Snowflake query performance, warehouse utilization, and resource optimization
+
+tables:
+  - name: QUERY_PERFORMANCE
+    description: Detailed query execution metrics including timing, resource usage, and performance indicators
+    base_table:
+      database: PERF_ADVISOR
+      schema: AGENT_SCHEMA
+      table: QUERY_PERFORMANCE_V
+    dimensions:
+      - name: query_id
+        description: Unique identifier for the query
+        expr: QUERY_ID
+        data_type: VARCHAR
+      - name: query_text
+        description: The SQL text of the query
+        expr: QUERY_TEXT
+        data_type: VARCHAR
+      - name: database_name
+        description: Database where the query executed
+        expr: DATABASE_NAME
+        data_type: VARCHAR
+      - name: schema_name
+        description: Schema where the query executed
+        expr: SCHEMA_NAME
+        data_type: VARCHAR
+      - name: warehouse_name
+        description: Warehouse used to execute the query
+        expr: WAREHOUSE_NAME
+        data_type: VARCHAR
+      - name: warehouse_size
+        description: Size of the warehouse (XS, S, M, L, XL, etc.)
+        expr: WAREHOUSE_SIZE
+        data_type: VARCHAR
+      - name: user_name
+        description: User who executed the query
+        expr: USER_NAME
+        data_type: VARCHAR
+      - name: role_name
+        description: Role used to execute the query
+        expr: ROLE_NAME
+        data_type: VARCHAR
+      - name: execution_status
+        description: Query execution status (SUCCESS, FAIL, INCIDENT)
+        expr: EXECUTION_STATUS
+        data_type: VARCHAR
+      - name: query_type
+        description: Type of query (SELECT, INSERT, UPDATE, DELETE, CREATE, etc.)
+        expr: QUERY_TYPE
+        data_type: VARCHAR
+      - name: query_tag
+        description: Optional tag assigned to the query
+        expr: QUERY_TAG
+        data_type: VARCHAR
+    time_dimensions:
+      - name: start_time
+        description: When the query started executing
+        expr: START_TIME
+        data_type: TIMESTAMP
+      - name: end_time
+        description: When the query finished executing
+        expr: END_TIME
+        data_type: TIMESTAMP
+    measures:
+      - name: execution_time_seconds
+        description: Total elapsed time in seconds
+        expr: EXECUTION_TIME_SECONDS
+        data_type: NUMBER
+        default_aggregation: avg
+      - name: compilation_time_seconds
+        description: Time spent compiling the query in seconds
+        expr: COMPILATION_TIME_SECONDS
+        data_type: NUMBER
+        default_aggregation: avg
+      - name: query_execution_time_seconds
+        description: Actual query execution time in seconds
+        expr: QUERY_EXECUTION_TIME_SECONDS
+        data_type: NUMBER
+        default_aggregation: avg
+      - name: queue_provisioning_seconds
+        description: Time spent waiting for warehouse provisioning
+        expr: QUEUE_PROVISIONING_SECONDS
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: queue_overload_seconds
+        description: Time spent queued due to warehouse overload
+        expr: QUEUE_OVERLOAD_SECONDS
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: blocked_time_seconds
+        description: Time blocked by other transactions
+        expr: BLOCKED_TIME_SECONDS
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: bytes_scanned
+        description: Bytes scanned during query execution
+        expr: BYTES_SCANNED
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: bytes_written
+        description: Bytes written during query execution
+        expr: BYTES_WRITTEN
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: rows_produced
+        description: Number of rows returned by the query
+        expr: ROWS_PRODUCED
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: partitions_scanned
+        description: Number of partitions scanned
+        expr: PARTITIONS_SCANNED
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: partitions_total
+        description: Total partitions in scanned tables
+        expr: PARTITIONS_TOTAL
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: partition_scan_ratio_pct
+        description: Percentage of partitions scanned (lower is better for clustered tables)
+        expr: PARTITION_SCAN_RATIO_PCT
+        data_type: NUMBER
+        default_aggregation: avg
+      - name: bytes_spilled_local
+        description: Bytes spilled to local storage (indicates memory pressure)
+        expr: BYTES_SPILLED_TO_LOCAL_STORAGE
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: bytes_spilled_remote
+        description: Bytes spilled to remote storage (indicates need for larger warehouse)
+        expr: BYTES_SPILLED_TO_REMOTE_STORAGE
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: query_count
+        description: Count of queries
+        expr: "1"
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: cloud_credits
+        description: Credits used for cloud services
+        expr: CREDITS_USED_CLOUD_SERVICES
+        data_type: NUMBER
+        default_aggregation: sum
+
+  - name: WAREHOUSE_METRICS
+    description: Hourly warehouse performance metrics and utilization patterns
+    base_table:
+      database: PERF_ADVISOR
+      schema: AGENT_SCHEMA
+      table: WAREHOUSE_METRICS_V
+    dimensions:
+      - name: warehouse_name
+        description: Name of the warehouse
+        expr: WAREHOUSE_NAME
+        data_type: VARCHAR
+    time_dimensions:
+      - name: hour
+        description: Hour of the metrics
+        expr: HOUR
+        data_type: TIMESTAMP
+    measures:
+      - name: query_count
+        description: Number of queries executed
+        expr: QUERY_COUNT
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: avg_execution_time_sec
+        description: Average query execution time in seconds
+        expr: AVG_EXECUTION_TIME_SEC
+        data_type: NUMBER
+        default_aggregation: avg
+      - name: max_execution_time_sec
+        description: Maximum query execution time in seconds
+        expr: MAX_EXECUTION_TIME_SEC
+        data_type: NUMBER
+        default_aggregation: max
+      - name: total_queue_time_sec
+        description: Total time queries spent queued due to overload
+        expr: TOTAL_QUEUE_TIME_SEC
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: cloud_credits
+        description: Cloud service credits consumed
+        expr: CLOUD_CREDITS
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: failed_queries
+        description: Number of failed queries
+        expr: FAILED_QUERIES
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: bytes_spilled_local
+        description: Bytes spilled to local storage
+        expr: BYTES_SPILLED_LOCAL
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: bytes_spilled_remote
+        description: Bytes spilled to remote storage
+        expr: BYTES_SPILLED_REMOTE
+        data_type: NUMBER
+        default_aggregation: sum
+
+  - name: SLOW_QUERIES
+    description: Queries that exceeded performance thresholds with severity classification
+    base_table:
+      database: PERF_ADVISOR
+      schema: AGENT_SCHEMA
+      table: SLOW_QUERIES_V
+    dimensions:
+      - name: query_id
+        description: Unique query identifier
+        expr: QUERY_ID
+        data_type: VARCHAR
+      - name: query_text
+        description: SQL text of the slow query
+        expr: QUERY_TEXT
+        data_type: VARCHAR
+      - name: user_name
+        description: User who ran the query
+        expr: USER_NAME
+        data_type: VARCHAR
+      - name: warehouse_name
+        description: Warehouse used
+        expr: WAREHOUSE_NAME
+        data_type: VARCHAR
+      - name: warehouse_size
+        description: Size of warehouse
+        expr: WAREHOUSE_SIZE
+        data_type: VARCHAR
+      - name: database_name
+        description: Database context
+        expr: DATABASE_NAME
+        data_type: VARCHAR
+      - name: severity
+        description: Issue severity - CRITICAL (over 5 min), WARNING (over 1 min), NORMAL
+        expr: SEVERITY
+        data_type: VARCHAR
+    time_dimensions:
+      - name: start_time
+        description: Query start time
+        expr: START_TIME
+        data_type: TIMESTAMP
+    measures:
+      - name: execution_time_seconds
+        description: Total execution time in seconds
+        expr: EXECUTION_TIME_SECONDS
+        data_type: NUMBER
+        default_aggregation: avg
+      - name: queue_time_seconds
+        description: Time spent in queue in seconds
+        expr: QUEUE_TIME_SECONDS
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: partition_scan_ratio_pct
+        description: Partition scan ratio percentage
+        expr: PARTITION_SCAN_RATIO_PCT
+        data_type: NUMBER
+        default_aggregation: avg
+      - name: bytes_spilled_remote
+        description: Remote spill bytes indicating memory pressure
+        expr: BYTES_SPILLED_TO_REMOTE_STORAGE
+        data_type: NUMBER
+        default_aggregation: sum
+
+  - name: WAREHOUSE_LOAD
+    description: Warehouse credit consumption for cost and scaling analysis
+    base_table:
+      database: PERF_ADVISOR
+      schema: AGENT_SCHEMA
+      table: WAREHOUSE_LOAD_V
+    dimensions:
+      - name: warehouse_name
+        description: Name of the warehouse
+        expr: WAREHOUSE_NAME
+        data_type: VARCHAR
+    time_dimensions:
+      - name: start_time
+        description: Metering period start
+        expr: START_TIME
+        data_type: TIMESTAMP
+      - name: end_time
+        description: Metering period end
+        expr: END_TIME
+        data_type: TIMESTAMP
+    measures:
+      - name: credits_used
+        description: Total credits consumed
+        expr: CREDITS_USED
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: credits_used_compute
+        description: Compute credits consumed
+        expr: CREDITS_USED_COMPUTE
+        data_type: NUMBER
+        default_aggregation: sum
+      - name: credits_used_cloud_services
+        description: Cloud services credits consumed
+        expr: CREDITS_USED_CLOUD_SERVICES
+        data_type: NUMBER
+        default_aggregation: sum
