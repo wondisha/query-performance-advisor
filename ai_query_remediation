@@ -1,0 +1,315 @@
+-- ============================================================================
+-- AI-GENERATED QUERY REMEDIATION SCRIPT
+-- Fixes for common Snowflake syntax errors from Cortex Code
+-- ============================================================================
+
+-- ############################################################################
+-- FIX 1: SHOW IN SUBQUERY (Error: unexpected 'SHOW')
+-- ############################################################################
+-- Original Error: SELECT * FROM (SHOW TASKS IN SCHEMA ...)
+-- Snowflake doesn't allow SHOW statements in subqueries
+
+-- INCORRECT:
+-- SELECT name, schedule, state FROM (SHOW TASKS IN SCHEMA SNOWFLAKE_INTELLIGENCE.GOVERNANCE)
+
+-- CORRECT PATTERN: Use RESULT_SCAN after SHOW
+CREATE OR REPLACE PROCEDURE PERF_ADVISOR.AGENT_SCHEMA.GET_TASKS_IN_SCHEMA(
+    p_database VARCHAR,
+    p_schema VARCHAR
+)
+RETURNS TABLE (task_name VARCHAR, schedule VARCHAR, state VARCHAR, warehouse VARCHAR)
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    res RESULTSET;
+BEGIN
+    EXECUTE IMMEDIATE 'SHOW TASKS IN SCHEMA ' || p_database || '.' || p_schema;
+    res := (SELECT "name" AS task_name, 
+                   "schedule" AS schedule, 
+                   "state" AS state,
+                   "warehouse" AS warehouse 
+            FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())));
+    RETURN TABLE(res);
+END;
+$$;
+
+
+-- ############################################################################
+-- FIX 2: GET DIAGNOSTICS (Error: unexpected 'DIAGNOSTICS')
+-- ############################################################################
+-- Original Error: GET DIAGNOSTICS v_rows = ROW_COUNT;
+-- Snowflake uses SQLROWCOUNT instead of GET DIAGNOSTICS
+
+-- INCORRECT:
+-- GET DIAGNOSTICS v_rows = ROW_COUNT;
+
+-- CORRECT PATTERN: Use SQLROWCOUNT after DML
+CREATE OR REPLACE PROCEDURE PERF_ADVISOR.AGENT_SCHEMA.EXAMPLE_ROW_COUNT_PATTERN()
+RETURNS VARCHAR
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    v_rows_inserted INTEGER := 0;
+    v_rows_updated INTEGER := 0;
+BEGIN
+    INSERT INTO my_table (col1) SELECT col1 FROM source_table WHERE condition;
+    v_rows_inserted := SQLROWCOUNT;
+    
+    UPDATE my_table SET col2 = 'value' WHERE col1 = 'filter';
+    v_rows_updated := SQLROWCOUNT;
+    
+    RETURN 'Inserted: ' || v_rows_inserted || ', Updated: ' || v_rows_updated;
+END;
+$$;
+
+
+-- ############################################################################
+-- FIX 3: INFORMATION_SCHEMA.USER_LIST() (Error: Unknown table function)
+-- ############################################################################
+-- Original Error: SELECT * FROM TABLE(INFORMATION_SCHEMA.USER_LIST())
+-- This function doesn't exist in Snowflake
+
+-- INCORRECT:
+-- SELECT name, disabled FROM TABLE(INFORMATION_SCHEMA.USER_LIST())
+
+-- CORRECT PATTERN A: Use SHOW + RESULT_SCAN
+CREATE OR REPLACE PROCEDURE PERF_ADVISOR.AGENT_SCHEMA.GET_USER_LIST()
+RETURNS TABLE (user_name VARCHAR, disabled VARCHAR, default_role VARCHAR)
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    res RESULTSET;
+BEGIN
+    SHOW USERS;
+    res := (SELECT "name" AS user_name, 
+                   "disabled" AS disabled,
+                   "default_role" AS default_role
+            FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())));
+    RETURN TABLE(res);
+END;
+$$;
+
+-- CORRECT PATTERN B: Use ACCOUNT_USAGE.USERS (has ~2hr latency)
+CREATE OR REPLACE VIEW PERF_ADVISOR.AGENT_SCHEMA.USER_LIST_V AS
+SELECT 
+    NAME AS user_name,
+    LOGIN_NAME,
+    DISPLAY_NAME,
+    DISABLED,
+    DEFAULT_ROLE,
+    DEFAULT_WAREHOUSE,
+    CREATED_ON,
+    LAST_SUCCESS_LOGIN
+FROM SNOWFLAKE.ACCOUNT_USAGE.USERS
+WHERE DELETED_ON IS NULL;
+
+
+-- ############################################################################
+-- FIX 4: LATERAL JOIN ORDER (Error: Lateral View cannot be on left side)
+-- ############################################################################
+-- Original Error: FROM LATERAL FLATTEN(...) f LEFT JOIN table t
+-- The base table must come before LATERAL FLATTEN
+
+-- INCORRECT:
+-- SELECT * FROM LATERAL FLATTEN(input => t.json_col) f LEFT JOIN my_table t
+
+-- CORRECT PATTERN: Base table first, then LATERAL
+CREATE OR REPLACE VIEW PERF_ADVISOR.AGENT_SCHEMA.FLATTENED_QUERY_TAGS_V AS
+SELECT 
+    qh.QUERY_ID,
+    qh.USER_NAME,
+    qh.START_TIME,
+    f.key AS tag_key,
+    f.value::STRING AS tag_value
+FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY qh,
+     LATERAL FLATTEN(input => TRY_PARSE_JSON(qh.QUERY_TAG), OUTER => TRUE) f
+WHERE qh.START_TIME >= DATEADD('day', -7, CURRENT_TIMESTAMP())
+  AND qh.QUERY_TAG IS NOT NULL
+  AND TRY_PARSE_JSON(qh.QUERY_TAG) IS NOT NULL;
+
+
+-- ############################################################################
+-- FIX 5: ORDER BY WITH CTE ALIASES (Error: not a valid order by expression)
+-- ############################################################################
+-- Original Error: ORDER BY ALL_VIOLATIONS.DATABASE_NAME
+-- In ORDER BY, use simple column names, not qualified CTE references
+
+-- INCORRECT:
+-- WITH all_violations AS (SELECT database_name, ... FROM ...)
+-- SELECT * FROM all_violations ORDER BY ALL_VIOLATIONS.DATABASE_NAME
+
+-- CORRECT PATTERN: Use column name directly
+CREATE OR REPLACE VIEW PERF_ADVISOR.AGENT_SCHEMA.GRANT_VIOLATIONS_V AS
+WITH all_violations AS (
+    SELECT 
+        g.grantee_name AS role_name,
+        g.privilege,
+        g.granted_on AS object_type,
+        g.name AS object_name,
+        g.table_catalog AS database_name,
+        g.table_schema AS schema_name,
+        'EXCESSIVE_PRIVILEGE' AS violation_type,
+        'WARNING' AS severity
+    FROM SNOWFLAKE.ACCOUNT_USAGE.GRANTS_TO_ROLES g
+    WHERE g.privilege IN ('OWNERSHIP', 'ALL')
+      AND g.granted_on IN ('DATABASE', 'SCHEMA')
+      AND g.deleted_on IS NULL
+      AND g.grantee_name NOT IN ('ACCOUNTADMIN', 'SECURITYADMIN', 'SYSADMIN')
+)
+SELECT * FROM all_violations
+ORDER BY database_name, schema_name, role_name;
+
+
+-- ############################################################################
+-- FIX 6: INFORMATION_SCHEMA.TASK_HISTORY (Error: Invalid identifier)
+-- ############################################################################
+-- Original Error: FROM TABLE(INFORMATION_SCHEMA.TASK_HISTORY(...))
+-- Must specify database context for TASK_HISTORY
+
+-- INCORRECT:
+-- SELECT * FROM TABLE(INFORMATION_SCHEMA.TASK_HISTORY(TASK_NAME => 'MY_TASK'))
+
+-- CORRECT PATTERN: Specify database.INFORMATION_SCHEMA
+CREATE OR REPLACE PROCEDURE PERF_ADVISOR.AGENT_SCHEMA.GET_TASK_HISTORY(
+    p_database VARCHAR,
+    p_task_name VARCHAR
+)
+RETURNS TABLE (name VARCHAR, state VARCHAR, scheduled_time TIMESTAMP, completed_time TIMESTAMP)
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    res RESULTSET;
+    sql_stmt VARCHAR;
+BEGIN
+    sql_stmt := 'SELECT NAME, STATE, SCHEDULED_TIME, COMPLETED_TIME 
+                 FROM TABLE(' || p_database || '.INFORMATION_SCHEMA.TASK_HISTORY(
+                     TASK_NAME => ''' || p_task_name || ''',
+                     SCHEDULED_TIME_RANGE_START => DATEADD(''day'', -7, CURRENT_TIMESTAMP())
+                 ))
+                 ORDER BY SCHEDULED_TIME DESC';
+    res := (EXECUTE IMMEDIATE :sql_stmt);
+    RETURN TABLE(res);
+END;
+$$;
+
+
+-- ############################################################################
+-- FIX 7: RESERVED WORD 'CURRENT' IN CASE (Error: unexpected 'current')
+-- ############################################################################
+-- Original Error: WHEN status = current THEN ...
+-- 'current' is a reserved word and must be quoted if used as a literal
+
+-- INCORRECT:
+-- CASE WHEN status = current THEN 'active' END
+
+-- CORRECT PATTERN: Quote reserved words or use different naming
+CREATE OR REPLACE VIEW PERF_ADVISOR.AGENT_SCHEMA.STATUS_EXAMPLE_V AS
+SELECT 
+    CASE 
+        WHEN status_field = 'current' THEN 'Active'  -- Use string literal
+        WHEN status_field = 'archived' THEN 'Inactive'
+        ELSE 'Unknown'
+    END AS status_label
+FROM (SELECT 'current' AS status_field);
+
+
+-- ############################################################################
+-- FIX 8: FILE_FORMAT INLINE SYNTAX (Error: unexpected 'FIELD_DELIMITER')
+-- ############################################################################
+-- Original Error: (FILE_FORMAT => (TYPE = CSV FIELD_DELIMITER = NONE))
+-- Inline file format needs different syntax or use named format
+
+-- INCORRECT:
+-- SELECT $1 FROM @stage/file.csv (FILE_FORMAT => (TYPE = CSV FIELD_DELIMITER = NONE))
+
+-- CORRECT PATTERN: Create and reference named file format
+CREATE OR REPLACE FILE FORMAT PERF_ADVISOR.AGENT_SCHEMA.RAW_TEXT_FORMAT
+    TYPE = CSV
+    FIELD_DELIMITER = NONE
+    RECORD_DELIMITER = NONE
+    ESCAPE_UNENCLOSED_FIELD = NONE;
+
+-- Then use:
+-- SELECT $1 FROM @stage/file.csv (FILE_FORMAT => PERF_ADVISOR.AGENT_SCHEMA.RAW_TEXT_FORMAT)
+
+
+-- ############################################################################
+-- UTILITY: VIEW TO TRACK AI-GENERATED QUERY ERRORS
+-- ############################################################################
+CREATE OR REPLACE VIEW PERF_ADVISOR.AGENT_SCHEMA.AI_QUERY_ERRORS_V AS
+SELECT 
+    QUERY_ID,
+    USER_NAME,
+    ERROR_CODE,
+    ERROR_MESSAGE,
+    LEFT(QUERY_TEXT, 500) AS query_sample,
+    START_TIME,
+    CASE 
+        WHEN ERROR_MESSAGE ILIKE '%unexpected ''SHOW''%' THEN 'SHOW_IN_SUBQUERY'
+        WHEN ERROR_MESSAGE ILIKE '%DIAGNOSTICS%' THEN 'GET_DIAGNOSTICS'
+        WHEN ERROR_MESSAGE ILIKE '%USER_LIST%' THEN 'INVALID_FUNCTION'
+        WHEN ERROR_MESSAGE ILIKE '%Lateral View cannot%' THEN 'LATERAL_JOIN_ORDER'
+        WHEN ERROR_MESSAGE ILIKE '%not a valid order by%' THEN 'CTE_ORDER_BY'
+        WHEN ERROR_MESSAGE ILIKE '%TASK_HISTORY%' THEN 'TASK_HISTORY_CONTEXT'
+        WHEN ERROR_MESSAGE ILIKE '%unexpected ''current''%' THEN 'RESERVED_WORD'
+        WHEN ERROR_MESSAGE ILIKE '%FIELD_DELIMITER%' THEN 'FILE_FORMAT_SYNTAX'
+        ELSE 'OTHER'
+    END AS error_category,
+    PARSE_JSON(QUERY_TAG):app::STRING AS source_app
+FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+WHERE EXECUTION_STATUS = 'FAIL'
+    AND QUERY_TAG ILIKE '%cortex_code%'
+    AND START_TIME >= DATEADD('day', -30, CURRENT_TIMESTAMP());
+
+
+-- ############################################################################
+-- SUMMARY: Quick Reference Card
+-- ############################################################################
+/*
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ SNOWFLAKE SYNTAX QUICK REFERENCE FOR AI-GENERATED QUERIES                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│ 1. SHOW IN SUBQUERY                                                         │
+│    ❌ SELECT * FROM (SHOW TABLES)                                           │
+│    ✅ SHOW TABLES; SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));       │
+│                                                                             │
+│ 2. ROW COUNT AFTER DML                                                      │
+│    ❌ GET DIAGNOSTICS v_rows = ROW_COUNT;                                   │
+│    ✅ v_rows := SQLROWCOUNT;                                                │
+│                                                                             │
+│ 3. LIST USERS                                                               │
+│    ❌ SELECT * FROM TABLE(INFORMATION_SCHEMA.USER_LIST())                   │
+│    ✅ SHOW USERS; SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));        │
+│    ✅ SELECT * FROM SNOWFLAKE.ACCOUNT_USAGE.USERS                           │
+│                                                                             │
+│ 4. LATERAL FLATTEN                                                          │
+│    ❌ FROM LATERAL FLATTEN(...) f JOIN table t                              │
+│    ✅ FROM table t, LATERAL FLATTEN(...) f                                  │
+│                                                                             │
+│ 5. ORDER BY WITH CTE                                                        │
+│    ❌ ORDER BY cte_name.column_name                                         │
+│    ✅ ORDER BY column_name                                                  │
+│                                                                             │
+│ 6. TASK_HISTORY                                                             │
+│    ❌ TABLE(INFORMATION_SCHEMA.TASK_HISTORY(...))                           │
+│    ✅ TABLE(DATABASE.INFORMATION_SCHEMA.TASK_HISTORY(...))                  │
+│                                                                             │
+│ 7. RESERVED WORDS                                                           │
+│    ❌ WHERE col = current                                                   │
+│    ✅ WHERE col = 'current'                                                 │
+│                                                                             │
+│ 8. INLINE FILE_FORMAT                                                       │
+│    ❌ (FILE_FORMAT => (TYPE = CSV FIELD_DELIMITER = NONE))                  │
+│    ✅ Create named FILE FORMAT, then reference it                           │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+*/
+
+-- Grant permissions
+GRANT USAGE ON ALL PROCEDURES IN SCHEMA PERF_ADVISOR.AGENT_SCHEMA TO ROLE SYSADMIN;
+GRANT SELECT ON ALL VIEWS IN SCHEMA PERF_ADVISOR.AGENT_SCHEMA TO ROLE SYSADMIN;
