@@ -1,0 +1,291 @@
+-- ============================================
+-- QUERY PERFORMANCE ADVISOR AGENT
+-- ============================================
+
+-- 1. Create database and schema for the agent
+CREATE DATABASE IF NOT EXISTS PERF_ADVISOR;
+CREATE SCHEMA IF NOT EXISTS PERF_ADVISOR.AGENT_SCHEMA;
+
+USE DATABASE PERF_ADVISOR;
+USE SCHEMA AGENT_SCHEMA;
+
+-- 2. Create a view consolidating query performance data
+CREATE OR REPLACE VIEW PERF_ADVISOR.AGENT_SCHEMA.QUERY_PERFORMANCE_V AS
+SELECT 
+    QUERY_ID,
+    QUERY_TEXT,
+    DATABASE_NAME,
+    SCHEMA_NAME,
+    WAREHOUSE_NAME,
+    WAREHOUSE_SIZE,
+    USER_NAME,
+    ROLE_NAME,
+    EXECUTION_STATUS,
+    ERROR_CODE,
+    ERROR_MESSAGE,
+    START_TIME,
+    END_TIME,
+    TOTAL_ELAPSED_TIME / 1000 AS EXECUTION_TIME_SECONDS,
+    BYTES_SCANNED,
+    BYTES_WRITTEN,
+    ROWS_PRODUCED,
+    COMPILATION_TIME / 1000 AS COMPILATION_TIME_SECONDS,
+    EXECUTION_TIME / 1000 AS QUERY_EXECUTION_TIME_SECONDS,
+    QUEUED_PROVISIONING_TIME / 1000 AS QUEUE_PROVISIONING_SECONDS,
+    QUEUED_OVERLOAD_TIME / 1000 AS QUEUE_OVERLOAD_SECONDS,
+    QUEUED_REPAIR_TIME / 1000 AS QUEUE_REPAIR_SECONDS,
+    TRANSACTION_BLOCKED_TIME / 1000 AS BLOCKED_TIME_SECONDS,
+    PARTITIONS_SCANNED,
+    PARTITIONS_TOTAL,
+    CASE 
+        WHEN PARTITIONS_TOTAL > 0 THEN ROUND(PARTITIONS_SCANNED / PARTITIONS_TOTAL * 100, 2)
+        ELSE 0 
+    END AS PARTITION_SCAN_RATIO_PCT,
+    BYTES_SPILLED_TO_LOCAL_STORAGE,
+    BYTES_SPILLED_TO_REMOTE_STORAGE,
+    QUERY_TYPE,
+    CLUSTER_NUMBER,
+    QUERY_TAG,
+    CREDITS_USED_CLOUD_SERVICES
+FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+WHERE START_TIME >= DATEADD('day', -30, CURRENT_TIMESTAMP());
+
+-- 3. Create warehouse metrics view
+CREATE OR REPLACE VIEW PERF_ADVISOR.AGENT_SCHEMA.WAREHOUSE_METRICS_V AS
+SELECT 
+    WAREHOUSE_NAME,
+    DATE_TRUNC('hour', START_TIME) AS HOUR,
+    COUNT(*) AS QUERY_COUNT,
+    AVG(TOTAL_ELAPSED_TIME)/1000 AS AVG_EXECUTION_TIME_SEC,
+    MAX(TOTAL_ELAPSED_TIME)/1000 AS MAX_EXECUTION_TIME_SEC,
+    SUM(QUEUED_OVERLOAD_TIME)/1000 AS TOTAL_QUEUE_TIME_SEC,
+    SUM(CREDITS_USED_CLOUD_SERVICES) AS CLOUD_CREDITS,
+    COUNT(CASE WHEN EXECUTION_STATUS = 'FAIL' THEN 1 END) AS FAILED_QUERIES,
+    SUM(BYTES_SPILLED_TO_LOCAL_STORAGE) AS BYTES_SPILLED_LOCAL,
+    SUM(BYTES_SPILLED_TO_REMOTE_STORAGE) AS BYTES_SPILLED_REMOTE
+FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+WHERE START_TIME >= DATEADD('day', -30, CURRENT_TIMESTAMP())
+    AND WAREHOUSE_NAME IS NOT NULL
+GROUP BY 1, 2;
+
+-- 4. Create slow queries view
+CREATE OR REPLACE VIEW PERF_ADVISOR.AGENT_SCHEMA.SLOW_QUERIES_V AS
+SELECT 
+    QUERY_ID,
+    QUERY_TEXT,
+    USER_NAME,
+    WAREHOUSE_NAME,
+    WAREHOUSE_SIZE,
+    DATABASE_NAME,
+    TOTAL_ELAPSED_TIME / 1000 AS EXECUTION_TIME_SECONDS,
+    QUEUED_OVERLOAD_TIME / 1000 AS QUEUE_TIME_SECONDS,
+    BYTES_SPILLED_TO_REMOTE_STORAGE,
+    PARTITIONS_SCANNED,
+    PARTITIONS_TOTAL,
+    CASE 
+        WHEN PARTITIONS_TOTAL > 0 THEN ROUND(PARTITIONS_SCANNED / PARTITIONS_TOTAL * 100, 2)
+        ELSE 0 
+    END AS PARTITION_SCAN_RATIO_PCT,
+    START_TIME,
+    CASE 
+        WHEN TOTAL_ELAPSED_TIME / 1000 > 300 THEN 'CRITICAL'
+        WHEN TOTAL_ELAPSED_TIME / 1000 > 60 THEN 'WARNING'
+        ELSE 'NORMAL'
+    END AS SEVERITY
+FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+WHERE START_TIME >= DATEADD('day', -7, CURRENT_TIMESTAMP())
+    AND TOTAL_ELAPSED_TIME / 1000 > 30
+    AND EXECUTION_STATUS = 'SUCCESS'
+ORDER BY TOTAL_ELAPSED_TIME DESC;
+
+-- 5. Create warehouse load analysis view
+CREATE OR REPLACE VIEW PERF_ADVISOR.AGENT_SCHEMA.WAREHOUSE_LOAD_V AS
+WITH warehouse_config AS (
+    SELECT DISTINCT
+        WAREHOUSE_NAME,
+        WAREHOUSE_SIZE
+    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+    WHERE START_TIME >= DATEADD('day', -30, CURRENT_TIMESTAMP())
+        AND WAREHOUSE_NAME IS NOT NULL
+)
+SELECT 
+    wm.WAREHOUSE_NAME,
+    wm.START_TIME,
+    wm.END_TIME,
+    wm.CREDITS_USED,
+    wm.CREDITS_USED_COMPUTE,
+    wm.CREDITS_USED_CLOUD_SERVICES,
+    wc.WAREHOUSE_SIZE,
+    NULL AS AUTO_SUSPEND,
+    NULL AS AUTO_RESUME,
+    1 AS MIN_CLUSTER_COUNT,
+    1 AS MAX_CLUSTER_COUNT,
+    'STANDARD' AS SCALING_POLICY
+FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY wm
+LEFT JOIN warehouse_config wc ON wm.WAREHOUSE_NAME = wc.WAREHOUSE_NAME
+WHERE wm.START_TIME >= DATEADD('day', -30, CURRENT_TIMESTAMP());
+
+-- 6. Create stage for semantic model
+CREATE OR REPLACE STAGE PERF_ADVISOR.AGENT_SCHEMA.SEMANTIC_STAGE;
+
+-- 7. Create stored procedure for optimization recommendations
+CREATE OR REPLACE PROCEDURE PERF_ADVISOR.AGENT_SCHEMA.GET_OPTIMIZATION_RECOMMENDATIONS(
+    ANALYSIS_TYPE VARCHAR,
+    TARGET_NAME VARCHAR DEFAULT NULL
+)
+RETURNS VARIANT
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    result VARIANT;
+BEGIN
+    CASE UPPER(ANALYSIS_TYPE)
+        WHEN 'SLOW_QUERIES' THEN
+            SELECT OBJECT_CONSTRUCT(
+                'analysis_type', 'SLOW_QUERIES',
+                'recommendations', ARRAY_AGG(
+                    OBJECT_CONSTRUCT(
+                        'query_id', QUERY_ID,
+                        'execution_time_sec', EXECUTION_TIME_SECONDS,
+                        'queue_time_sec', QUEUE_TIME_SECONDS,
+                        'severity', SEVERITY,
+                        'warehouse', WAREHOUSE_NAME,
+                        'issues', ARRAY_CONSTRUCT(
+                            CASE WHEN PARTITION_SCAN_RATIO_PCT > 50 THEN 'High partition scan ratio - add clustering key' END,
+                            CASE WHEN BYTES_SPILLED_TO_REMOTE_STORAGE > 0 THEN 'Remote spilling detected - increase warehouse size' END,
+                            CASE WHEN QUEUE_TIME_SECONDS > 10 THEN 'High queue time - scale warehouse or enable multi-cluster' END
+                        )
+                    )
+                )
+            ) INTO result
+            FROM PERF_ADVISOR.AGENT_SCHEMA.SLOW_QUERIES_V
+            WHERE (TARGET_NAME IS NULL OR WAREHOUSE_NAME = TARGET_NAME)
+            LIMIT 20;
+            
+        WHEN 'WAREHOUSE_SIZING' THEN
+            SELECT OBJECT_CONSTRUCT(
+                'analysis_type', 'WAREHOUSE_SIZING',
+                'warehouse', TARGET_NAME,
+                'metrics', ARRAY_AGG(
+                    OBJECT_CONSTRUCT(
+                        'hour', HOUR,
+                        'query_count', QUERY_COUNT,
+                        'avg_execution_time', AVG_EXECUTION_TIME_SEC,
+                        'total_queue_time', TOTAL_QUEUE_TIME_SEC,
+                        'spill_to_remote', BYTES_SPILLED_REMOTE,
+                        'recommendation', CASE 
+                            WHEN TOTAL_QUEUE_TIME_SEC > 60 THEN 'SCALE UP: High queue times detected'
+                            WHEN BYTES_SPILLED_REMOTE > 1073741824 THEN 'SCALE UP: Significant remote spilling'
+                            WHEN QUERY_COUNT < 5 AND AVG_EXECUTION_TIME_SEC < 5 THEN 'SCALE DOWN: Low utilization'
+                            ELSE 'OPTIMAL: Current sizing appropriate'
+                        END
+                    )
+                )
+            ) INTO result
+            FROM PERF_ADVISOR.AGENT_SCHEMA.WAREHOUSE_METRICS_V
+            WHERE (TARGET_NAME IS NULL OR WAREHOUSE_NAME = TARGET_NAME)
+                AND HOUR >= DATEADD('hour', -24, CURRENT_TIMESTAMP())
+            GROUP BY ALL;
+            
+        WHEN 'SCALING_POLICY' THEN
+            SELECT OBJECT_CONSTRUCT(
+                'analysis_type', 'SCALING_POLICY',
+                'recommendations', ARRAY_AGG(
+                    OBJECT_CONSTRUCT(
+                        'warehouse', WAREHOUSE_NAME,
+                        'current_min_clusters', MIN_CLUSTER_COUNT,
+                        'current_max_clusters', MAX_CLUSTER_COUNT,
+                        'current_scaling_policy', SCALING_POLICY,
+                        'avg_credits', AVG(CREDITS_USED),
+                        'recommendation', CASE 
+                            WHEN MAX_CLUSTER_COUNT = 1 AND AVG(CREDITS_USED) > 10 THEN 'Enable multi-cluster with STANDARD scaling'
+                            WHEN SCALING_POLICY = 'ECONOMY' AND AVG(CREDITS_USED) > 20 THEN 'Switch to STANDARD scaling for better performance'
+                            ELSE 'Current configuration is appropriate'
+                        END
+                    )
+                )
+            ) INTO result
+            FROM PERF_ADVISOR.AGENT_SCHEMA.WAREHOUSE_LOAD_V
+            WHERE (TARGET_NAME IS NULL OR WAREHOUSE_NAME = TARGET_NAME)
+            GROUP BY WAREHOUSE_NAME, MIN_CLUSTER_COUNT, MAX_CLUSTER_COUNT, SCALING_POLICY;
+            
+        ELSE
+            result := OBJECT_CONSTRUCT('error', 'Invalid analysis type. Use: SLOW_QUERIES, WAREHOUSE_SIZING, or SCALING_POLICY');
+    END CASE;
+    
+    RETURN result;
+END;
+$$;
+
+-- 8. Create the Cortex Agent
+CREATE OR REPLACE AGENT PERF_ADVISOR.AGENT_SCHEMA.QUERY_PERFORMANCE_ADVISOR
+  COMMENT = 'AI Agent that analyzes query performance, identifies issues, and provides optimization recommendations'
+  PROFILE = '{"display_name": "Query Performance Advisor", "color": "blue"}'
+  FROM SPECIFICATION $$
+  {
+    "models": {
+      "orchestration": "claude-4-sonnet"
+    },
+    "instructions": {
+      "system": "You are an expert Snowflake performance advisor. You analyze query performance, warehouse utilization, and provide actionable recommendations to optimize cost and performance.",
+      "orchestration": "For questions about specific queries or performance metrics, use the performance_analyst tool. For optimization recommendations, scaling advice, or warehouse sizing suggestions, use the optimizer tool. Always provide specific, actionable recommendations.",
+      "response": "Provide clear, concise recommendations. When identifying issues, explain the impact and prioritize by severity. Include specific SQL or configuration changes when applicable."
+    },
+    "tools": [
+      {
+        "tool_spec": {
+          "type": "cortex_analyst_text_to_sql",
+          "name": "performance_analyst",
+          "description": "Queries performance data including query history, warehouse metrics, slow queries, and resource utilization. Use for questions about query performance, execution times, queue times, spilling, warehouse usage patterns, and historical trends."
+        }
+      },
+      {
+        "tool_spec": {
+          "type": "generic",
+          "name": "optimizer",
+          "description": "Generates optimization recommendations for slow queries, warehouse sizing, and scaling policies. Use when user asks for recommendations, suggestions, or wants to know how to improve performance.",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "analysis_type": {
+                "type": "string",
+                "description": "Type of analysis: SLOW_QUERIES (analyze problematic queries), WAREHOUSE_SIZING (right-size recommendations), SCALING_POLICY (multi-cluster and scaling advice)"
+              },
+              "target_name": {
+                "type": "string",
+                "description": "Optional: specific warehouse name to analyze"
+              }
+            },
+            "required": ["analysis_type"]
+          }
+        }
+      }
+    ],
+    "tool_resources": {
+      "performance_analyst": {
+        "semantic_model_file": "@PERF_ADVISOR.AGENT_SCHEMA.SEMANTIC_STAGE/performance_semantic_model.yaml",
+        "execution_environment": {
+          "type": "warehouse",
+          "warehouse": "COMPUTE_WH"
+        },
+        "query_timeout": 120
+      },
+      "optimizer": {
+        "type": "procedure",
+        "identifier": "PERF_ADVISOR.AGENT_SCHEMA.GET_OPTIMIZATION_RECOMMENDATIONS",
+        "execution_environment": {
+          "type": "warehouse",
+          "warehouse": "COMPUTE_WH"
+        }
+      }
+    }
+  }
+  $$;
+
+-- 9. Grant necessary permissions
+GRANT USAGE ON DATABASE PERF_ADVISOR TO ROLE SYSADMIN;
+GRANT USAGE ON SCHEMA PERF_ADVISOR.AGENT_SCHEMA TO ROLE SYSADMIN;
+GRANT SELECT ON ALL VIEWS IN SCHEMA PERF_ADVISOR.AGENT_SCHEMA TO ROLE SYSADMIN;
+GRANT USAGE ON PROCEDURE PERF_ADVISOR.AGENT_SCHEMA.GET_OPTIMIZATION_RECOMMENDATIONS(VARCHAR, VARCHAR) TO ROLE SYSADMIN;
+GRANT USAGE ON AGENT PERF_ADVISOR.AGENT_SCHEMA.QUERY_PERFORMANCE_ADVISOR TO ROLE SYSADMIN;
